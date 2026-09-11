@@ -1,0 +1,34 @@
+version: '3.8'
+
+# Sidecar / Pod 共享网络栈模式（最高安全等级，零侵入无特权）：
+# 业务容器通过 network_mode: "service:gateway" 直接共享网关网络栈。
+# 网关仅需 NET_ADMIN 配置自身 nftables 规则。
+
+networks:
+  # 纯粹的外部网络，无需受保护的内部网桥
+  public_net:
+    driver: bridge
+    enable_ipv6: true
+
+services:
+  # 1. 出口防火墙安全网关
+  gateway:
+    image: ghcr.io/shaogme/nix-nft-egress:latest
+    container_name: egress_gateway
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../whitelist.txt:/etc/nftables/whitelist.txt:ro
+    networks:
+      - public_net
+    restart: unless-stopped
+
+  # 2. 纯净无特权业务应用
+  business-app:
+    image: alpine:latest
+    container_name: business_app
+    # 核心声明：直接共享网关网络，无需任何网络配置，零特权
+    network_mode: "service:gateway"
+    depends_on:
+      - gateway
+    command: ["sleep", "infinity"]

@@ -1,0 +1,163 @@
+name: Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Custom tag (defaults to YYYYMMDD in Beijing Time)'
+        required: false
+        default: ''
+
+jobs:
+  build-x64:
+    name: Build x64 Image (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build gateway image with Nix
+        run: nix-build default.nix
+
+      - name: Load and tag amd64 image
+        run: |
+          docker load < result
+          docker tag nix-nft-gateway:latest nix-nft-gateway:amd64
+          docker save nix-nft-gateway:amd64 -o image-amd64.tar
+
+      - name: Upload amd64 artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: image-amd64
+          path: image-amd64.tar
+          retention-days: 1
+
+  build-arm64:
+    name: Build arm64 Image (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build gateway image with Nix
+        run: nix-build default.nix
+
+      - name: Load and tag arm64 image
+        run: |
+          docker load < result
+          docker tag nix-nft-gateway:latest nix-nft-gateway:arm64
+          docker save nix-nft-gateway:arm64 -o image-arm64.tar
+
+      - name: Upload arm64 artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: image-arm64
+          path: image-arm64.tar
+          retention-days: 1
+
+  publish:
+    name: Publish Multi-Arch Image (ubuntu x64)
+    needs: [build-x64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Download amd64 artifact
+        uses: actions/download-artifact@main
+        with:
+          name: image-amd64
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@main
+        with:
+          name: image-arm64
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load Docker images
+        run: |
+          docker load -i image-amd64.tar
+          docker load -i image-arm64.tar
+          docker image ls
+
+      - name: Push multi-arch images and manifests
+        run: |
+          # 统一将镜像仓库名转为小写
+          IMAGE_BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          # 年月日格式（北京时间，例：20260911）
+          DATE_TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$DATE_TAG" ]; then
+            DATE_TAG=$(TZ='Asia/Shanghai' date +'%Y%m%d')
+          fi
+
+          echo "Publishing to repository: ${IMAGE_BASE}"
+          echo "Date tag: ${DATE_TAG}"
+
+          AMD64_TAG="${IMAGE_BASE}:${DATE_TAG}-amd64"
+          ARM64_TAG="${IMAGE_BASE}:${DATE_TAG}-arm64"
+
+          # 标记各架构独立镜像
+          docker tag nix-nft-gateway:amd64 "$AMD64_TAG"
+          docker tag nix-nft-gateway:arm64 "$ARM64_TAG"
+
+          # 推送各架构独立镜像
+          docker push "$AMD64_TAG"
+          docker push "$ARM64_TAG"
+
+          # 发布/更新年月日格式 Tag 的多架构 Manifest（若已有重复 tag，则强制替换标记新构建）
+          docker manifest rm "${IMAGE_BASE}:${DATE_TAG}" 2>/dev/null || true
+          docker manifest create "${IMAGE_BASE}:${DATE_TAG}" \
+            "$AMD64_TAG" \
+            "$ARM64_TAG"
+          docker manifest annotate "${IMAGE_BASE}:${DATE_TAG}" "$AMD64_TAG" --os linux --arch amd64
+          docker manifest annotate "${IMAGE_BASE}:${DATE_TAG}" "$ARM64_TAG" --os linux --arch arm64
+          docker manifest push --purge "${IMAGE_BASE}:${DATE_TAG}"
+
+          # 发布/更新 latest Tag 的多架构 Manifest
+          docker manifest rm "${IMAGE_BASE}:latest" 2>/dev/null || true
+          docker manifest create "${IMAGE_BASE}:latest" \
+            "$AMD64_TAG" \
+            "$ARM64_TAG"
+          docker manifest annotate "${IMAGE_BASE}:latest" "$AMD64_TAG" --os linux --arch amd64
+          docker manifest annotate "${IMAGE_BASE}:latest" "$ARM64_TAG" --os linux --arch arm64
+          docker manifest push --purge "${IMAGE_BASE}:latest"
+
+          echo "Successfully published:"
+          echo "  - ${IMAGE_BASE}:${DATE_TAG}"
+          echo "  - ${IMAGE_BASE}:latest"
+
+      - name: Update Git Tag
+        run: |
+          DATE_TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$DATE_TAG" ]; then
+            DATE_TAG=$(TZ='Asia/Shanghai' date +'%Y%m%d')
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 若 Git tag 已存在，则强制转移标记到最新的构建 commit
+          git tag -f "$DATE_TAG"
+          git push origin "refs/tags/${DATE_TAG}:refs/tags/${DATE_TAG}" --force || echo "Git tag push skipped or failed"

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-check:
+    name: Cargo Clippy & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Run Cargo Fmt Check
+        run: cargo fmt --manifest-path nft-egress-daemon/Cargo.toml -- --check
+
+      - name: Run Cargo Clippy
+        run: cargo clippy --manifest-path nft-egress-daemon/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Run Cargo Test
+        run: cargo test --manifest-path nft-egress-daemon/Cargo.toml --all-targets --all-features
+
+  test:
+    name: Run test_runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build gateway image with Nix
+        run: nix-build default.nix
+
+      - name: Load gateway image into Docker
+        run: docker load < result
+
+      - name: Run test_runner.sh
+        run: |
+          chmod +x test_runner.sh
+          ./test_runner.sh
+
+      - name: Teardown test environment
+        if: always()
+        run: |
+          docker compose -p nix-nft-test -f docker/docker-compose.test.yml down -v --remove-orphans 2>/dev/null || docker-compose -p nix-nft-test -f docker/docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
+
+  ci-success:
+    name: ci success
+    needs: [cargo-check, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate Check
+        run: |
+          if [ "${{ needs.cargo-check.result }}" != "success" ] || [ "${{ needs.test.result }}" != "success" ]; then
+            echo "CI checks failed or were cancelled:"
+            echo "  cargo-check: ${{ needs.cargo-check.result }}"
+            echo "  test: ${{ needs.test.result }}"
+            exit 1
+          fi
+          echo "All CI checks succeeded!"

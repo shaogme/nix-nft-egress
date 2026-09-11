@@ -1,0 +1,39 @@
+version: '3.8'
+
+# 静态固定 IP 模式示例 (Sidecar 架构)：
+# 业务容器通过 network_mode: "service:gateway" 共享网关网络栈。
+# 仅需在网关容器声明外部网络的固定 IPv4 / IPv6 地址，业务容器即可自动共享该固定出口 IP。
+
+networks:
+  # 外部双栈出口网桥（固定子网）
+  public_net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+        - subnet: fd00:cafe:babe::/64
+
+services:
+  # 1. 出口防火墙安全网关 (Sidecar)
+  gateway:
+    image: ghcr.io/shaogme/nix-nft-egress:latest
+    container_name: egress_gateway
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../whitelist.txt:/etc/nftables/whitelist.txt:ro
+    networks:
+      public_net:
+        ipv4_address: 172.21.0.2
+        ipv6_address: fd00:cafe:babe::2
+    restart: unless-stopped
+
+  # 2. 纯净受保护业务容器：零网络特权，共享网关固定 IP
+  business-app:
+    image: alpine:latest
+    container_name: business_app
+    network_mode: "service:gateway"
+    depends_on:
+      - gateway
+    command: ["sleep", "infinity"]
